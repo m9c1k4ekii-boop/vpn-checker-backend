@@ -24,18 +24,11 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.12'  # Исправление для Ubuntu 24.04
           cache: 'pip'
 
       - name: Install Dependencies
         run: pip install -r requirements.txt
-
-      - name: Download Xray (linux-64)
-        run: |
-          wget -O xray.zip https://github.com/XTLS/Xray-core/releases/download/v26.1.23/Xray-linux-64.zip
-          unzip xray.zip -d xray-bin
-          mv xray-bin/xray ./xray
-          chmod +x ./xray
 
       - name: Run Checker Script
         run: python main.py

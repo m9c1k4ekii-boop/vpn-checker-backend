@@ -1,25 +1,10 @@
 """
-white_checker.py  —  реальная проверка «белого списка» через xray.
+white_checker.py — максимально лайтовая проверка «белого списка» через xray.
 
-Алгоритм для одного ключа:
-  1. Парсим vpn_uri → xray outbound-объект (vless/vmess/trojan/ss).
-  2. Генерируем временный JSON-конфиг xray с SOCKS5-прокси на свободном порту.
-  3. Запускаем xray run как subprocess.
-  4. Вместо фиксированного sleep — активно опрашиваем порт (socket.connect_ex)
-     до реального поднятия SOCKS5 (или до XRAY_STARTUP_TIMEOUT).
-  5. Делаем HTTPS-запросы к WHITE_TEST_DOMAINS через socks5h-прокси.
-  6. Если >= WHITE_THRESHOLD доменов ответили любым HTTP-кодом — WHITE, иначе BLACK.
-  7. В finally: гарантированно kill xray + удаляем временный конфиг.
-
-Улучшения по сравнению с первой версией:
-  - Активный опрос порта вместо time.sleep  → на быстрых серверах экономит 1-2 с.
-  - Ограниченный параллелизм через ThreadPoolExecutor + Semaphore (WHITE_WORKERS):
-    при 200 ключах и 5 воркерах время сокращается в ~5 раз.
-  - Кеш белого статуса: результат сохраняется в history dict и повторно
-    не проверяется в течение WHITE_CACHE_HOURS часов.
-  - xray_available() — публичная функция для быстрой проверки наличия бинарника.
-  - Поддержка транспортов: tcp, ws, grpc, h2, httpupgrade для всех протоколов.
-  - Graceful shutdown: сначала terminate → wait(3) → kill.
+Идея:
+  - Проверяем всего один стабильный домен.
+  - Достаточно одного успешного HTTP-ответа, чтобы считать ключ WHITE.
+  - Ошибки / таймауты / падения xray → BLACK (но критерии максимально мягкие).
 """
 
 import json
@@ -44,53 +29,35 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Публичные константы / конфигурация
 # =============================================================================
 
-# Якорные домены РФ белого списка (банк, платёжная система, ритейл)
-WHITE_TEST_DOMAINS = ["alfabank.ru", "mironline.ru", "vkusvill.ru"]
+# Один простой домен для проверки доступности (можешь поменять под себя)
+WHITE_TEST_DOMAINS = ["alfabank.ru"]
 
-# Сколько доменов должны ответить, чтобы ключ считался WHITE
-WHITE_THRESHOLD = 2
+# Достаточно ответа хотя бы от одного домена
+WHITE_THRESHOLD = 1
 
-# Максимальный таймаут на один HTTP-запрос через прокси (с)
 HTTP_TIMEOUT = 5
-
-# Максимальное время ожидания старта xray (активный опрос порта)
 XRAY_STARTUP_TIMEOUT = 5.0
-
-# Интервал опроса порта при ожидании старта xray (с)
 XRAY_POLL_INTERVAL = 0.15
-
-# Общий таймаут на одну белую проверку (старт xray + HTTP-запросы)
 WHITE_CHECK_TIMEOUT = 22.0
-
-# Параллельных xray-процессов одновременно (не перегружаем CPU/сеть)
 WHITE_WORKERS = 5
-
-# Через сколько часов перечеченять белый статус уже проверенного ключа
 WHITE_CACHE_HOURS = 24
 
-# Путь к бинарнику: ENV > рядом со скриптом > PATH
 XRAY_BIN = os.environ.get(
     "XRAY_BIN",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "xray"),
 )
 
-# =============================================================================
-# Внутренний глобальный семафор (ограничивает параллелизм)
-# =============================================================================
 _sem = Semaphore(WHITE_WORKERS)
-
 
 # =============================================================================
 # Утилиты
 # =============================================================================
 
 def xray_available() -> bool:
-    """Возвращает True, если бинарник xray найден и исполняем."""
     return _xray_binary() is not None
 
 
 def _xray_binary() -> Optional[str]:
-    """Ищет бинарник xray: ENV-переменная → рядом со скриптом → PATH."""
     if os.path.isfile(XRAY_BIN) and os.access(XRAY_BIN, os.X_OK):
         return XRAY_BIN
     base = os.path.dirname(os.path.abspath(__file__))
@@ -102,18 +69,12 @@ def _xray_binary() -> Optional[str]:
 
 
 def _free_port() -> int:
-    """Находит свободный TCP-порт на 127.0.0.1."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
 def _wait_for_port(port: int, timeout: float) -> bool:
-    """
-    Активно опрашивает 127.0.0.1:port каждые XRAY_POLL_INTERVAL секунд.
-    Возвращает True, когда порт принимает соединения, или False по таймауту.
-    Гораздо надёжнее и быстрее, чем фиксированный time.sleep.
-    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -123,22 +84,15 @@ def _wait_for_port(port: int, timeout: float) -> bool:
         time.sleep(XRAY_POLL_INTERVAL)
     return False
 
-
 # =============================================================================
 # Парсинг URI → xray outbound
 # =============================================================================
 
 def _p(params: dict, key: str, default: str = "") -> str:
-    """Получает первое значение из parse_qs-словаря."""
     return params.get(key, [default])[0]
 
 
 def _stream_settings(params: dict, net: str, security: str, host: str) -> dict:
-    """
-    Универсальный строитель streamSettings для любого протокола.
-    Поддерживает: tcp, ws, grpc, h2, httpupgrade.
-    Поддерживает security: none, tls, reality.
-    """
     sni      = _p(params, "sni", host)
     fp       = _p(params, "fp", "chrome")
     pbk      = _p(params, "pbk", "")
@@ -149,7 +103,6 @@ def _stream_settings(params: dict, net: str, security: str, host: str) -> dict:
 
     ss: dict = {"network": net}
 
-    # Безопасность
     if security == "tls":
         tls_cfg: dict = {
             "allowInsecure": True,
@@ -171,7 +124,6 @@ def _stream_settings(params: dict, net: str, security: str, host: str) -> dict:
     else:
         ss["security"] = "none"
 
-    # Транспорт
     if net == "ws":
         ss["wsSettings"] = {"path": path, "headers": {"Host": h_header}}
     elif net == "grpc":
@@ -194,12 +146,9 @@ def _parse_vless(uri: str) -> Optional[dict]:
     try:
         body = uri[len("vless://"):]
         user_id, rest = body.split("@", 1)
-        # Хост может содержать IPv6 в квадратных скобках
-        host_port_qs, *_ = rest.split("?", 1) + [""]
         qs = rest.split("?", 1)[1] if "?" in rest else ""
         qs = qs.split("#")[0]
         host_port = rest.split("?")[0]
-        # rsplit по ":" безопасен для IPv6 [::1]:port
         host, port_s = host_port.rsplit(":", 1)
         host = host.strip("[]")
         port = int(port_s)
@@ -304,19 +253,12 @@ def _parse_vmess(uri: str) -> Optional[dict]:
 
 
 def _parse_ss(uri: str) -> Optional[dict]:
-    """
-    Поддерживает два формата ShadowSocks URI:
-      ss://BASE64(method:pass)@host:port
-      ss://BASE64(method:pass@host:port)
-    Параметр ?plugin= игнорируется (xray v2fly не поддерживает плагины через эту схему).
-    """
     try:
         body = uri[len("ss://"):]
-        body = body.split("#")[0].split("?")[0]  # убираем имя и плагин
+        body = body.split("#")[0].split("?")[0]
 
         if "@" in body:
             cred_part, host_port = body.rsplit("@", 1)
-            # cred_part может быть base64 или plaintext
             try:
                 pad = cred_part + "=" * (-len(cred_part) % 4)
                 decoded_cred = b64decode(pad).decode("utf-8")
@@ -330,7 +272,6 @@ def _parse_ss(uri: str) -> Optional[dict]:
                 else:
                     return None
         else:
-            # Весь URI — base64
             pad = body + "=" * (-len(body) % 4)
             decoded = b64decode(pad).decode("utf-8")
             if "@" not in decoded:
@@ -369,7 +310,6 @@ def _build_outbound(vpn_uri: str) -> Optional[dict]:
 
 
 def _build_xray_config(outbound: dict, socks_port: int) -> dict:
-    """Минимальный xray-конфиг: SOCKS5-прокси → один VPN-outbound."""
     return {
         "log": {"loglevel": "none"},
         "inbounds": [{
@@ -387,33 +327,17 @@ def _build_xray_config(outbound: dict, socks_port: int) -> dict:
         "routing": {
             "domainStrategy": "AsIs",
             "rules": [
-                # Весь трафик через VPN
                 {"type": "field", "outboundTag": "proxy", "port": "0-65535"},
             ],
         },
     }
-
 
 # =============================================================================
 # Основные функции
 # =============================================================================
 
 def is_white_key(vpn_uri: str, timeout: float = WHITE_CHECK_TIMEOUT) -> bool:
-    """
-    Проверяет, является ли vpn_uri «белым» ключом.
-
-    Алгоритм:
-      1. Парсим URI → xray outbound.
-      2. Запускаем xray с SOCKS5-прокси на свободном порту.
-      3. Активно ждём, пока порт начнёт принимать соединения.
-      4. Делаем HTTPS-запросы к WHITE_TEST_DOMAINS через socks5h.
-      5. WHITE, если >= WHITE_THRESHOLD доменов ответили (любой HTTP-код).
-
-    Returns:
-        True  — WHITE
-        False — BLACK / ошибка / xray не найден
-    """
-    with _sem:  # ограничиваем параллелизм глобальным семафором
+    with _sem:
         return _check_one(vpn_uri, timeout)
 
 
@@ -446,11 +370,9 @@ def _check_one(vpn_uri: str, timeout: float) -> bool:
             stderr=subprocess.DEVNULL,
         )
 
-        # Активный опрос: ждём, пока SOCKS5 реально начнёт слушать порт
         if not _wait_for_port(socks_port, XRAY_STARTUP_TIMEOUT):
-            return False  # xray не поднялся за отведённое время
+            return False
 
-        # xray мог упасть сразу после bind (краш)
         if proc.poll() is not None:
             return False
 
@@ -473,7 +395,6 @@ def _check_one(vpn_uri: str, timeout: float) -> bool:
 
         success = 0
         for domain in WHITE_TEST_DOMAINS:
-            # Прерываемся, если уже не хватает времени
             if time.monotonic() - t_start > timeout - 1:
                 break
             try:
@@ -485,11 +406,9 @@ def _check_one(vpn_uri: str, timeout: float) -> bool:
                     verify=False,
                     headers=headers,
                 )
-                # Любой HTTP-ответ означает сетевую доступность сервера
                 if resp.status_code < 600:
                     success += 1
             except requests.exceptions.ProxyError:
-                # SOCKS5 прокси отклонил — xray упал или не смог подключиться
                 pass
             except Exception:
                 pass
@@ -505,7 +424,6 @@ def _check_one(vpn_uri: str, timeout: float) -> bool:
 
 
 def _kill_proc(proc: Optional[subprocess.Popen]) -> None:
-    """Graceful shutdown: terminate → wait(3с) → kill."""
     if proc is None:
         return
     try:
@@ -527,7 +445,6 @@ def _rm_file(path: Optional[str]) -> None:
         except Exception:
             pass
 
-
 # =============================================================================
 # Пакетная проверка с прогрессом и кешем
 # =============================================================================
@@ -540,24 +457,10 @@ def batch_white_check(
     cache_hours: float = WHITE_CACHE_HOURS,
     label: str = "",
 ) -> tuple[list, list]:
-    """
-    Пакетная WHITE/BLACK проверка списка ключей.
-
-    Параметры:
-      keys        — список финальных ключей (с хвостом #...), уже отсортированы по пингу
-      history     — словарь кеша из history.json (читается и обновляется on-the-fly)
-      workers     — параллельных xray-процессов (по умолчанию WHITE_WORKERS)
-      cache_hours — сколько часов кешировать результат (по умолчанию WHITE_CACHE_HOURS)
-      label       — метка для вывода прогресса ("RU" / "EURO")
-
-    Возвращает:
-      (white_keys, black_keys) — два списка финальных ключей
-    """
     now = time.time()
     white_keys: list = []
     black_keys: list = []
 
-    # Разбиваем на кешированные и требующие проверки
     cached_white, cached_black, to_test = [], [], []
     for k in keys:
         k_id = k.split("#")[0]
@@ -583,9 +486,6 @@ def batch_white_check(
     completed = 0
     total = len(to_test)
 
-    # Ограничиваем параллелизм: workers воркеров одновременно
-    # Семафор _sem уже ограничивает на уровне is_white_key,
-    # но ThreadPoolExecutor тоже ставим = workers для экономии памяти
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_key = {
             executor.submit(is_white_key, k.split("#")[0]): k
@@ -599,7 +499,6 @@ def batch_white_check(
             except Exception:
                 result = False
 
-            # Обновляем кеш
             if k_id in history:
                 history[k_id]["white"] = result
                 history[k_id]["white_time"] = time.time()

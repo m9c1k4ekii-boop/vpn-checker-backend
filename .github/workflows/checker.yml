@@ -30,10 +30,10 @@ jobs:
       - name: Install Dependencies
         run: pip install -r requirements.txt
 
-      - name: Download Xray linux amd64
+            - name: Download Xray linux amd64
         run: |
           curl -L "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" -o xray.zip
-          unzip xray.zip
+          unzip -o xray.zip
           chmod +x xray
 
       - name: Run Checker Script
